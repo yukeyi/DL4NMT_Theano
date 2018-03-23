@@ -36,7 +36,7 @@ def main():
                         help='Dim of word embedding, default is %(default)s')
     parser.add_argument('--maxlen', action='store', default=80, type=int, dest='maxlen',
                         help='Max sentence length, default is %(default)s')
-    parser.add_argument('-S', action='store_false', default=True, dest='shuffle',
+    parser.add_argument('-S', action='store_false', default=False, dest='shuffle',
                         help='Shuffle data per epoch, default is True, set to False')
     parser.add_argument('--train1', action='store', metavar='filename', dest='train1', type=str,
                         default='filtered_en-fr.en',
@@ -168,6 +168,8 @@ def main():
                         help='Update frequency of student model, default to 10')
     parser.add_argument('--state_batchsize', action='store', default=32, type=int, dest='state_batchsize',
                         help='Number of data for choosing loss function, default to 32')
+    parser.add_argument('--candidate_size', action='store', default=8, type=int, dest='candidate_size',
+                        help='Size of candidate for a simple input sentence, default to 4')
 
     args = parser.parse_args()
     print args
@@ -198,7 +200,7 @@ def main():
 
     # If dataset is not 'en-fr', old value of dataset options like 'args.train1' will be omitted
     if args.dataset != 'en-fr':
-        args.train1, args.train2, args.small1, args.small2, args.valid1, args.valid2, valid3, test1, test2, args.dic1, args.dic2 = \
+        args.train1, args.train2, args.small1, args.small2, args.valid1, args.valid2, args.valid3, test1, test2, args.dic1, args.dic2 = \
             Datasets[args.dataset]
     zhen = 'zh-en' in args.dataset and 'wmt17' not in args.dataset
 
@@ -238,9 +240,8 @@ def main():
 
     # build the teacher model
     # input, hidden, output
-    model_teacher = None
 
-    model_teacher = TModel(9,10,8)
+    #model_teacher = TModel(9,10,8)
     teacher_batch_size = args.teacher_batch_size
     data = []
 
@@ -248,18 +249,21 @@ def main():
     from libs.nmt_my import train
     import numpy as np
 
-    model_teacher.load_policy()
+    #model_teacher.load_policy()
     while(True):
-        #sequence = {
-        #            'state': [[1.,1.,1.,1.,1.],[1.,2.,1.,2.,1.],[1.,2.,1.,0.,2.]],
-        #            'action': [0,1,2],
-        #            'reward': np.random.random()
-        #           }
+        '''
+        sequence = {
+                    'state': [[1.,1.,1.,1.,1.],[1.,2.,1.,2.,1.],[1.,2.,1.,0.,2.]],
+                    'action': [0,1,2],
+                    'reward': np.random.random()
+                   }
         teacher_epoch = 0
+        '''
         sequence = train(
-            teacher=model_teacher,
+            teacher=None,
             update_frequence_batches = args.update_frequence_batches,
             state_batchsize = args.state_batchsize,
+            candidate_size = args.candidate_size,
             max_epochs= args.max_epochs,
             saveto=args.model_file,
             preload=args.pre_load_file,
@@ -268,7 +272,7 @@ def main():
             dim=args.dim,
             decay_c=0.,
             clip_c=args.clip,
-            lrate=args.learning_rate,
+            lrate=0.2,#args.learning_rate,
             optimizer=args.optimizer,
             maxlen=args.maxlen,
             batch_size=args.batch_size,
@@ -281,7 +285,7 @@ def main():
             valid_datasets=('./data/dev/{}'.format(args.valid1),
                             './data/dev/{}'.format(args.valid2) if not zhen else './data/dic/{}'.format(args.valid2), #for zhen, dev1 is the giza file, stored in /data/dic
                             #'./data/dev/{}{}'.format(valid3, '0' if zhen else '')), #hot fix for zhen valid file
-                            './data/dev/{}'.format(valid3)),
+                            './data/dev/{}'.format(args.valid3)),
             small_train_datasets=('./data/train/{}'.format(args.small1),
                                   './data/train/{}'.format(args.small2)),
             vocab_filenames=('./data/dic/{}'.format(args.dic1),
@@ -342,14 +346,16 @@ def main():
         print(sequence)
 
         data.append(sequence)
-        if(len(data) >= teacher_batch_size):
-            cost = model_teacher.train(data)
-            print(cost)
-            model_teacher.save_policy(teacher_epoch, 'teacher_model_')
-            data = []
+        #if(len(data) >= teacher_batch_size):
+        #    cost = model_teacher.train(data)
+        #    print(cost)
+        #    model_teacher.save_policy(teacher_epoch, 'teacher_model_')
+        #    data = []
 
 
 
 if __name__ == '__main__':
     theano.config.floatX = 'float32'
+    #theano.config.lib.cnmem = 0.3
+    #theano.config.gpu_options.per_process_gpu_memory_fraction = 0.3
     main()

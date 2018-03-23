@@ -144,7 +144,7 @@ def adadelta(lr, tparams, grads, inp, cost, **kwargs):
     zgup = [(zg, g) for zg, g in zip(zipped_grads, grads)]
 
     f_grad_shared = theano.function(inp, outputs, updates=zgup ,
-                                    profile=profile)
+                                    profile=profile, on_unused_input='warn')
 
     rg2up = [(rg2, alpha * rg2 + (1 - alpha) * (g ** 2))
              for rg2, g in zip(running_grads2, zipped_grads)]

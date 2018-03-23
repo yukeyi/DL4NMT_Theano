@@ -19,7 +19,7 @@ import theano.tensor as T
 import numpy as np
 import cPickle as pkl
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
-import lasagne
+#import lasagne
 
 from ..constants import fX, profile
 from ..config import DefaultOptions
@@ -323,6 +323,7 @@ class NMTModel(object):
         self.f_init = None
         self.f_next = None
         self.trng = None
+        self.candidate_size = None
 
     def input_to_context(self, given_input=None, **kwargs):
         """Build the part of the model that from input to context vector.
@@ -336,22 +337,30 @@ class NMTModel(object):
 
         get_gates = kwargs.pop('get_gates', False)
 
-        x, x_mask, y, y_mask = self.get_input() if given_input is None else given_input
+        x, x_mask, y, y_mask, predicted_ys, predicted_y_masks = self.get_input() if given_input is None else given_input
+        dup_x = x.T.repeat([self.candidate_size], axis=0).T
+        dup_x_mask = x_mask.T.repeat([self.candidate_size],axis=0).T
 
         # For the backward rnn, we just need to invert x and x_mask
         x_r, x_mask_r = self.reverse_input(x, x_mask)
+        dup_x_r, dup_x_mask_r = self.reverse_input(dup_x, dup_x_mask)
 
         n_timestep, n_timestep_tgt, n_samples = self.input_dimensions(x, y)
+        predicted_n_timestep, predicted_n_timestep_tgt, predicted_n_samples = self.input_dimensions(dup_x, predicted_ys)
 
         # Word embedding for forward rnn and backward rnn (source)
         src_embedding = self.embedding(x, n_timestep, n_samples)
         src_embedding_r = self.embedding(x_r, n_timestep, n_samples)
+        predicted_src_embedding = self.embedding(dup_x, predicted_n_timestep, predicted_n_samples)
+        predicted_src_embedding_r = self.embedding(dup_x_r, predicted_n_timestep, predicted_n_samples)
 
         # Encoder
         context, kw_ret = self.encoder(src_embedding, src_embedding_r, x_mask, x_mask_r,
                                        dropout_params=kwargs.pop('dropout_params', None), get_gates=get_gates)
+        predicted_context, predicted_kw_ret = self.encoder(predicted_src_embedding, predicted_src_embedding_r, dup_x_mask, dup_x_mask_r,
+                                       dropout_params=kwargs.pop('dropout_params', None), get_gates=get_gates)
 
-        return [x, x_mask, y, y_mask], context, kw_ret
+        return [x, x_mask, y, y_mask], context, kw_ret, [dup_x, dup_x_mask, predicted_ys, predicted_y_masks], predicted_context, predicted_kw_ret
 
     def input_to_decoder_context(self, given_input=None):
         """Build the part of the model that from input to context vector of decoder.
@@ -361,7 +370,7 @@ class NMTModel(object):
         :return: tuple of input list and output
         """
 
-        (x, x_mask, y, y_mask), context, _ = self.input_to_context(given_input)
+        (x, x_mask, y, y_mask), context, _,  = self.input_to_context(given_input)
 
         n_timestep, n_timestep_tgt, n_samples = self.input_dimensions(x, y)
 
@@ -394,8 +403,9 @@ class NMTModel(object):
     def sync_tparams(self):
         sync_tparams(self.P, self.dupP)
 
-    def build_model(self, set_instance_variables=False):
+    def build_model(self, confidence, candidate_size, set_instance_variables=False):
         """Build a training model."""
+        self.candidate_size = candidate_size
 
         dropout_rate = self.O['use_dropout']
 
@@ -410,13 +420,17 @@ class NMTModel(object):
         else:
             dropout_params = None
 
-        (x, x_mask, y, y_mask), context, _ = self.input_to_context(dropout_params=dropout_params)
+        (x, x_mask, y, y_mask), context, _, (dup_x, dup_x_mask, predicted_ys, predicted_y_masks), predicted_context, _ = self.input_to_context(dropout_params=dropout_params)
 
         n_timestep, n_timestep_tgt, n_samples = self.input_dimensions(x, y)
+        predicted_n_timestep, predicted_n_timestep_tgt, predicted_n_samples = self.input_dimensions(dup_x, predicted_ys)
 
         context_mean = self.get_context_mean(context, x_mask)
+        predicted_context_mean = self.get_context_mean(predicted_context, dup_x_mask)
+
         # Initial decoder state
         init_decoder_state = self.feed_forward(context_mean, prefix='ff_state', activation=tanh)
+        predicted_init_decoder_state = self.feed_forward(predicted_context_mean, prefix='ff_state', activation=tanh)
 
         # Word embedding (target), we will shift the target sequence one time step
         # to the right. This is done because of the bi-gram connections in the
@@ -428,27 +442,47 @@ class NMTModel(object):
         tgt_embedding = emb_shifted
         pre_projected_context = self.attention_projected_context(context, prefix='decoder')
 
+        predicted_tgt_embedding = self.embedding(predicted_ys, predicted_n_timestep_tgt, predicted_n_samples, 'Wemb_dec')
+        predicted_emb_shifted = T.zeros_like(predicted_tgt_embedding)
+        predicted_emb_shifted = T.set_subtensor(predicted_emb_shifted[1:], predicted_tgt_embedding[:-1])
+        predicted_tgt_embedding = predicted_emb_shifted
+        predicted_pre_projected_context = self.attention_projected_context(predicted_context, prefix='decoder')
+
         # Decoder - pass through the decoder conditional gru with attention
         hidden_decoder, context_decoder, opt_ret['dec_alphas'], _ = self.decoder(
             tgt_embedding, y_mask=y_mask, init_state=init_decoder_state, context=context, x_mask=x_mask,
             projected_context=pre_projected_context, dropout_params=dropout_params, one_step=False,
         )
 
+        predicted_hidden_decoder, predicted_context_decoder, opt_ret['dec_alphas'], _ = self.decoder(
+            predicted_tgt_embedding, y_mask=predicted_y_masks, init_state=predicted_init_decoder_state, context=predicted_context, x_mask=dup_x_mask,
+            projected_context=predicted_pre_projected_context, dropout_params=dropout_params, one_step=False,
+        )
+
         trng, use_noise, probs = self.get_word_probability(hidden_decoder, context_decoder, tgt_embedding,
                                                            trng=trng, use_noise=use_noise)
+        _, _, predicted_probs = self.get_word_probability(predicted_hidden_decoder, predicted_context_decoder, predicted_tgt_embedding,
+                                                           trng=trng, use_noise=use_noise)
+
         test_cost_F = self.build_cost_Focal(y, y_mask, probs)
-        test_cost_CE = self.build_cost_CE(y, y_mask, probs)
-        predicted_y = T.matrix('predicted_y',dtype='int64')
-        predicted_y_mask = T.matrix('predicted_y_mask',dtype=fX)
-        predicted_probs = T.matrix('predicted_probs',dtype=fX)
+        if(confidence == 1):
+            test_cost_CE = self.build_cost_CE(y, y_mask, probs)
+        else:
+            test_cost_CE = self.build_cost_LSCE(y, y_mask, probs, confidence)
         alpha = T.scalar('r', dtype=fX)
-        test_cost_M = self.build_cost_Margin(x, x_mask, y, y_mask, probs, predicted_y, predicted_y_mask, predicted_probs, alpha)
+        test_cost_M = self.build_cost_Margin(y, y_mask, probs, predicted_ys, predicted_y_masks, predicted_probs, alpha)
         y_hat_reward = T.matrix('y_hat_reward', dtype=fX)
         test_cost_B = self.build_cost_Bleu(y, y_mask, probs, y_hat_reward)
+        test_cost_MBO = self.build_cost_SeqNLL(predicted_ys, predicted_y_masks, predicted_probs)
+        multi_BLEU = T.vector('bleu_reward', dtype=fX)
+        test_cost_RISK = self.build_cost_Risk(predicted_ys, predicted_y_masks, predicted_probs, multi_BLEU)
+
         cost_F = test_cost_F / self.O['cost_normalization']  # cost used to derive gradient in training
         cost_CE = test_cost_CE / self.O['cost_normalization']  # cost used to derive gradient in training
         cost_M = test_cost_M / self.O['cost_normalization']  # cost used to derive gradient in training
         cost_B = test_cost_B / self.O['cost_normalization']  # cost used to derive gradient in training
+        cost_MBO = test_cost_MBO / self.O['cost_normalization']
+        cost_RISK = test_cost_RISK / self.O['cost_normalization']
 
         # Plot computation graph
         if self.O['plot_graph'] is not None:
@@ -488,8 +522,10 @@ class NMTModel(object):
             # Unused now
             self.x, self.x_mask, self.y, self.y_mask = x, x_mask, y, y_mask
 
-        return trng, use_noise, x, x_mask, y, y_mask, y_hat_reward, predicted_y, predicted_y_mask, predicted_probs, opt_ret, cost_CE, test_cost_CE, \
-               cost_F, test_cost_F, cost_M, test_cost_M, cost_B, test_cost_B, context_mean, probs, alpha
+        return trng, use_noise, x, x_mask, y, y_mask, y_hat_reward, predicted_ys, predicted_y_masks, opt_ret, \
+               cost_CE, test_cost_CE, \
+               cost_F, test_cost_F, cost_M, test_cost_M, cost_B, test_cost_B, cost_MBO, test_cost_MBO, \
+               cost_RISK, test_cost_RISK, multi_BLEU, context_mean, probs, alpha
 
     def build_context(self, **kwargs):
         """Build function to get encoder context (or encoder gates).
@@ -688,12 +724,40 @@ class NMTModel(object):
 
         batch_sample, batch_sample_score = self.gen_batch_sample2(
             x, x_mask,
-            k=k, maxlen=2000, eos_id=0,
+            k=k, maxlen=64, eos_id=0,
             stochastic=stochastic,
         )
         assert len(batch_sample) == len(batch_sample_score)
         return batch_sample, batch_sample_score
 
+    def generate_data(self, src_block, **kwargs):
+        batch_size = kwargs.pop('batch_size', 32)
+        k_cand = kwargs.pop('k_cand', self.candidate_size-1)
+
+        all_src_blocks = []
+        all_num = len(src_block)
+        m_block = (all_num + batch_size - 1) // batch_size
+        for idx in xrange(m_block):
+            all_src_blocks.append(src_block[batch_size * idx: batch_size * (idx + 1)])
+
+        tgt_samples = []
+
+        for src_ in all_src_blocks:
+            beam1_samples, beam1_sample_scores = self.translate_block_core(input_= src_, k = 1, stochastic=False)
+            beamk_samples, beamk_sample_scores = self.translate_block_core(input_= src_, k = k_cand, stochastic= False) #defulat k = 3
+            small_batch_size = len(src_)
+            for data_id in xrange(small_batch_size):
+                y_hats = []
+                for _k in xrange(k_cand + 1):
+                    y_hat = beamk_samples[data_id][_k] if _k < k_cand else beam1_samples[data_id][0]
+                    y_hats.append(y_hat)
+                tgt_samples = tgt_samples + y_hats #the chosen tgt samples for src, remove eos
+
+        for i in range(0,len(tgt_samples)):
+            tgt_samples[i] = tgt_samples[i][:-1]
+        tgt_samples = np.array(tgt_samples)
+
+        return tgt_samples
 
     def get_rl_reward(self, src_block, tgt_block, **kwargs):
         """
@@ -1271,8 +1335,10 @@ class NMTModel(object):
         x_mask = T.matrix('x_mask', dtype=fX)
         y = T.matrix('y', dtype='int64')
         y_mask = T.matrix('y_mask', dtype=fX)
+        predicted_ys = T.matrix('predicted_y', dtype='int64')
+        predicted_y_masks = T.matrix('predicted_y_mask', dtype=fX)
 
-        return x, x_mask, y, y_mask
+        return x, x_mask, y, y_mask, predicted_ys, predicted_y_masks
 
     @staticmethod
     def input_dimensions(x, y):
@@ -1286,7 +1352,7 @@ class NMTModel(object):
 
         n_timestep = x.shape[0]
         n_timestep_tgt = y.shape[0]
-        n_samples = x.shape[1]
+        n_samples = y.shape[1]
 
         return n_timestep, n_timestep_tgt, n_samples
 
@@ -1682,17 +1748,26 @@ class NMTModel(object):
 
     def build_cost_CE(self, y, y_mask, probs):
         """Build the cost from probabilities and target."""
-        # print('\n')
-        # print(y.type)
-        # print(y_mask.type)
-        # print(probs.type)
-        # print('\n')
         y_flat = y.flatten()
         y_flat_idx = T.arange(y_flat.shape[0]) * self.O['n_words'] + y_flat
         cost = -T.log(probs.flatten()[y_flat_idx])
         cost = cost.reshape([y.shape[0], y.shape[1]])
         cost = (cost * y_mask).sum(0)
+        return cost
 
+    def build_cost_LSCE(self, y, y_mask, probs, confidence):
+        """Build the cost from probabilities and target."""
+        print("Actually using Label Smooth Cross-Entropy")
+        low_confidence = (1-confidence) / (float)(self.O['n_words'] - 1)
+        y_flat = y.flatten()
+        ground_truth_probs = T.extra_ops.to_one_hot(y_flat, self.O['n_words'])
+        ground_truth_probs = ground_truth_probs * (confidence - low_confidence)
+        smoothing = T.ones_like(ground_truth_probs)*low_confidence
+        ground_truth_probs = ground_truth_probs + smoothing
+        every_vocab_cost = -T.log(probs.flatten())*ground_truth_probs.flatten()
+        every_vocab_cost = every_vocab_cost.reshape([y.shape[0], y.shape[1],self.O['n_words']])
+        cost = every_vocab_cost.sum(2)
+        cost = (cost * y_mask).sum(0)
         return cost
 
     def build_cost_Focal(self, y, y_mask, probs):
@@ -1705,88 +1780,77 @@ class NMTModel(object):
 
         return cost
 
-    '''
-    def sample_data_from_partial_groundtruth(self, x, x_mask, y, y_mask, probs, context):
-        # _, n_timestep_tgt, n_samples = self.input_dimensions(x, y)
-        # temp = np.random.random((n_samples,n_timestep_tgt))
-        # temp2 = temp*probs.shape[2]
-        # temp3 = temp2.astype(np.int32)
-        # return temp3
-        return y, y_mask, context
-
-    def get_probs_for_predict(self, x, x_mask, y, y_mask, **kwargs):
-        dropout_rate = self.O['use_dropout']
-
-        opt_ret = {}
-
-        trng = RandomStreams(1234)
-        use_noise = theano.shared(np.float32(0.))
-
-        if dropout_rate is not False:
-            dropout_params = [use_noise, trng, dropout_rate]
-        else:
-            dropout_params = None
-
-        n_timestep, n_timestep_tgt, n_samples = self.input_dimensions(x, y)
-
-
-
-        # generate context
-        get_gates = kwargs.pop('get_gates', False)
-        # For the backward rnn, we just need to invert x and x_mask
-        x_r, x_mask_r = self.reverse_input(x, x_mask)
-        # Word embedding for forward rnn and backward rnn (source)
-        src_embedding = self.embedding(x, n_timestep, n_samples)
-        src_embedding_r = self.embedding(x_r, n_timestep, n_samples)
-        # Encoder
-        context, kw_ret = self.encoder(src_embedding, src_embedding_r, x_mask, x_mask_r,
-                                       dropout_params=kwargs.pop('dropout_params', None), get_gates=get_gates)
-
-
-
-
-
-        context_mean = self.get_context_mean(context, x_mask)
-        # Initial decoder state
-        init_decoder_state = self.feed_forward(context_mean, prefix='ff_state', activation=tanh)
-
-        # Word embedding (target), we will shift the target sequence one time step
-        # to the right. This is done because of the bi-gram connections in the
-        # readout and decoder rnn. The first target will be all zeros and we will
-        # not condition on the last output.
-        tgt_embedding = self.embedding(y, n_timestep_tgt, n_samples, 'Wemb_dec')
-        emb_shifted = T.zeros_like(tgt_embedding)
-        emb_shifted = T.set_subtensor(emb_shifted[1:], tgt_embedding[:-1])
-        tgt_embedding = emb_shifted
-        pre_projected_context = self.attention_projected_context(context, prefix='decoder')
-
-        # Decoder - pass through the decoder conditional gru with attention
-        hidden_decoder, context_decoder, opt_ret['dec_alphas'], _ = self.decoder(
-            tgt_embedding, y_mask=y_mask, init_state=init_decoder_state, context=context, x_mask=x_mask,
-            projected_context=pre_projected_context, dropout_params=dropout_params, one_step=False,
-        )
-
-        _, _, probs = self.get_word_probability(hidden_decoder, context_decoder, tgt_embedding,
-                                                trng=trng, use_noise=use_noise)
-        return probs
-    '''
-
-    def build_cost_Margin(self, x, x_mask, y, y_mask, probs, predicted_y, predicted_y_mask, predicted_probs, alpha):
+    def build_cost_Margin(self, y, y_mask, probs, predicted_y, predicted_y_mask, predicted_probs, alpha):
         """Build the cost from probabilities and target."""
         y_flat = y.flatten()
         y_flat_idx = T.arange(y_flat.shape[0]) * self.O['n_words'] + y_flat
         cost = -T.log(probs.flatten()[y_flat_idx])
         cost = cost.reshape([y.shape[0], y.shape[1]])
         cost = (cost * y_mask).sum(0)
+        cost = cost.repeat([self.candidate_size],axis = 0)
+        #normal = y_mask.sum(0)
+        #cost = cost/normal
         predicted_y_flat = predicted_y.flatten()
         predicted_y_flat_idx = T.arange(predicted_y_flat.shape[0]) * self.O['n_words'] + predicted_y_flat
         predicted_cost = -T.log(predicted_probs.flatten()[predicted_y_flat_idx])
         predicted_cost = predicted_cost.reshape([predicted_y.shape[0], predicted_y.shape[1]])
         predicted_cost = (predicted_cost * predicted_y_mask).sum(0)
+        #predicted_normal = predicted_y_mask.sum(0)
+        #predicted_cost = predicted_cost/predicted_normal
         tao = cost - predicted_cost + alpha
         m_cost = T.maximum(tao,0)
-        return m_cost
 
+        # compatible with SeqNLL
+        m_cost = m_cost.reshape([m_cost.shape[0]/self.candidate_size,self.candidate_size])
+        m_cost.sum(1)*np.float(0.125)
+
+        return m_cost
+        #return (cost - predicted_cost)
+
+    def build_cost_SeqNLL(self, multi_predicted_y, multi_predicted_y_mask, multi_predicted_probs):
+        """Build the cost from probabilities and target."""
+        y_flat = multi_predicted_y.flatten()
+        y_flat_idx = T.arange(y_flat.shape[0]) * self.O['n_words'] + y_flat
+        cost = T.log(multi_predicted_probs.flatten()[y_flat_idx])
+        cost = cost.reshape([multi_predicted_y.shape[0], multi_predicted_y.shape[1]])
+        cost = (cost * multi_predicted_y_mask).sum(0) / multi_predicted_y_mask.sum(0)
+        cost = T.exp(cost)
+        cost = cost.reshape([cost.shape[0]/self.candidate_size, self.candidate_size])
+        sum_cost = T.log(cost.sum(1))
+        opt_cost = (cost*np.array([1]+[0]*(self.candidate_size-1))).sum(1)
+        opt_cost = -T.log(opt_cost)
+        cost = sum_cost + opt_cost
+        return cost
+
+    def build_cost_Risk(self, multi_predicted_y, multi_predicted_y_mask, multi_predicted_probs, multi_BLEU):
+        """Build the cost from probabilities and target."""
+        y_flat = multi_predicted_y.flatten()
+        y_flat_idx = T.arange(y_flat.shape[0]) * self.O['n_words'] + y_flat
+        cost = T.log(multi_predicted_probs.flatten()[y_flat_idx])
+        cost = cost.reshape([multi_predicted_y.shape[0], multi_predicted_y.shape[1]])
+        cost = (cost * multi_predicted_y_mask).sum(0) / multi_predicted_y_mask.sum(0)
+        cost = T.exp(cost)
+        cost = cost.reshape([cost.shape[0]/self.candidate_size, self.candidate_size])
+        multi_BLEU = multi_BLEU.reshape([multi_BLEU.shape[0]/self.candidate_size,self.candidate_size])
+        sum_denominator = cost.sum(1)
+        sum_numerator = (cost*(1-multi_BLEU)).sum(1)
+        return sum_numerator / sum_denominator
+
+
+    '''
+    def build_cost_MultiMargin(self, x, x_mask, costs, scores):
+        """Build the cost from probabilities and target."""
+        maxcost = costs.max(axis=1)
+        scores_flat = scores.flatten()
+        maxcost_index = costs.argmax(axis=1)
+        maxcost_index = T.arange(scores.shape[0]) * scores.shape[1] + maxcost_index
+        maxscores = scores_flat[maxcost_index]
+        fmax_vector = maxcost+maxscores
+        fmax_matrix = np.array()
+        MMloss =
+        return MMloss.sum(0)
+        # return (cost - predicted_cost)
+    '''
     def build_cost_Bleu(self, y, y_mask, probs, y_hat_scores):
         """Build the cost from probabilities and target."""
         y_flat = y.flatten()
@@ -1795,7 +1859,6 @@ class NMTModel(object):
         cost = cost * y_hat_scores.flatten()
         cost = cost.reshape([y.shape[0], y.shape[1]])
         cost = (cost * y_mask).sum(0)
-
         return cost
 
     def save_whole_model(self, model_file, iteration=-1):

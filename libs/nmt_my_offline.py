@@ -251,11 +251,24 @@ def train(teacher = None,
           ):
     model_options = locals().copy()
 
-    randomID = np.random.random()*10000
+    f = open("offline_sample_data" + str(0), 'r')
+    for i in range(0, validFreq):
+
+        predicted_y = []
+        x = []
+        y = []
+
+        for j in range(0, batch_size):
+            for t in range(0, candidate_size):
+                predicted_y.append(eval(f.readline()))
+            x.append(eval(f.readline()))
+            #y.append(eval(f.readline()))
+            f.readline()
+
+        a = 1
 
     # Set distributed computing environment
     worker_id = 0
-
     if dist_type == 'mv':
         try:
             import multiverso as mv
@@ -329,8 +342,6 @@ Start Time = {}
         )
 
     if not zhen:
-        #valid_datasets = ('./data/test/test.de-en.bpe.25000.de','./data/test/test.de-en.bpe.25000.en','./data/test/test.de-en.en')
-
         valid_iterator=TextIterator(
             valid_datasets[0], valid_datasets[1],
             vocab_filenames[0], vocab_filenames[1],
@@ -563,12 +574,10 @@ Start Time = {}
         for t_value in itemlist(model.P):
             t_value.set_value(t_value.get_value() / workers_cnt)
 
-    best_valid_cost = validation(valid_iterator, f_cost_CE, use_noise)
-    small_train_cost = validation(small_train_iterator, f_cost_CE, use_noise)
-    best_bleu = translate_dev_get_bleu(model, f_init, f_next, trng, use_noise, zhen = zhen) if reload_ else 0
-    message('Worker id {}, Initial Valid cost {:.5f} Small train cost {:.5f} Valid BLEU {:.2f}'.format(worker_id, best_valid_cost, small_train_cost, best_bleu))
-
-    exit(0)
+    #best_valid_cost = validation(valid_iterator, f_cost_CE, use_noise)
+    #small_train_cost = validation(small_train_iterator, f_cost_CE, use_noise)
+    #best_bleu = translate_dev_get_bleu(model, f_init, f_next, trng, use_noise, zhen = zhen) if reload_ else 0
+    #message('Worker id {}, Initial Valid cost {:.5f} Small train cost {:.5f} Valid BLEU {:.2f}'.format(worker_id, best_valid_cost, small_train_cost, best_bleu))
 
     best_bleu = previous_best_bleu
     best_valid_cost = previous_best_valid_cost #do not let initial state affect the training process
@@ -616,12 +625,8 @@ Start Time = {}
     value_return['state'] = []
     value_return['action'] = []
 
-    memory_test = True
-
     #if(loss_name == 'MBO'):
     #    offline_data = model.generate_offline_data(x)
-
-    model.save_model(str(randomID), history_errs, 666)
 
     for eidx in xrange(start_epoch, max_epochs):
 
@@ -638,56 +643,19 @@ Start Time = {}
             f = open("offline_sample_data"+str(eidx),'w+')
             print('start generating data')
 
-        # add four line
-        #data_collect_time = 0
-        #x = []
-        #y = []
-        #for i, (tempx, tempy) in enumerate(text_iterator):
-        for i, (x, y) in enumerate(text_iterator):
-            # add to if eidx == start_epoch
-            '''
-            if(data_collect_time == 3):
-                data_collect_time = 0
-                tempx = x+tempx
-                tempy = y+tempy
-                x = []
-                y = []
-                for ii in range(len(tempx)):
-                    if ii in seed:
-                        x.append(tempx[ii])
-                        y.append(tempy[ii])
-                i -= 3
-            elif(data_collect_time == 0):
-                x = []
-                y = []
-                x = x+tempx
-                y = y+tempy
-                data_collect_time += 1
-                continue
-            else:
-                data_collect_time += 1
-                x = x+tempx
-                y = y+tempy
-                continue
-            '''
+        f = open("offline_sample_data" + str(eidx), 'r')
+        for i in range(0, validFreq):
 
-            if (memory_test):
-                predicted_y = []
-                for i in range(0,len(x)*candidate_size):
-                    predicted_y.append([10000]*maxlen)
-                predicted_y = np.array(predicted_y)
-                #predicted_y = model.generate_data(x)
-                predicted_rewards = []
-                for i in range(0,len(predicted_y)):
-                    predicted_rewards.append(np.float32(.0))
-                predicted_rewards = np.array(predicted_rewards)
-                original_x = copy.deepcopy(x)
-                x, x_mask, y, y_mask = prepare_data(original_x, y, maxlen=maxlen)
-                _, _, predicted_y, predicted_y_mask = prepare_data(np.array(original_x).repeat([candidate_size],axis = 0), predicted_y, maxlen=sys.maxint)
-                cost_RISK, g2_value_RISK = f_grad_shared_RISK(x, x_mask, y, y_mask, predicted_y, predicted_y_mask, predicted_rewards)
-                f_update_RISK(np.float32(.0))
-                memory_test = False
-                continue
+            predicted_y = []
+            x = []
+            y = []
+
+            for j in range(0, batch_size):
+                for t in range(0,candidate_size):
+                    predicted_y.append(eval(f.readline()))
+                x.append(eval(f.readline()))
+                y.append(eval(f.readline()))
+                f.readline()
 
 
             if eidx == start_epoch and i < pass_batches: #ignore the first several batches when reload
@@ -735,8 +703,6 @@ Start Time = {}
                     f.write('\n')
                     if(i % candidate_size == candidate_size-1):
                         f.write(str(x[i/candidate_size]))
-                        f.write('\n')
-                        f.write(str(y[i/candidate_size]))
                         f.write('\n\n')
                 print(uidx)
                 continue
@@ -1407,8 +1373,6 @@ Start Time = {}
                 if not overwrite:
                     print 'Saving the model at iteration {}...'.format(uidx),
                     model.save_model(saveto, history_errs, uidx)
-                    model.save_model(str(randomID), history_errs, uidx)
-                    print str(randomID)
                     print 'Done'
                     sys.stdout.flush()
 
@@ -1476,6 +1440,7 @@ Start Time = {}
                 estop = True
                 break
 
+        f.close()
         if(loss_name == 'G'):
             f.close()
         print 'Seen {} samples in worker {}'.format(n_samples, worker_id)
